@@ -1,46 +1,56 @@
 <?php
-header('Content-Type: application/json');
-require_once __DIR__ . '/Credentials.php';
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
 
-// Helper function
 function RespondWithJsonNotice($StatusCode, $Notice, $Extra = array())
 {
-	http_response_code($StatusCode);
-	$Result = array('Notice' => $Notice);
-	foreach ($Extra as $Key => $Value) {
-		$Result[$Key] = $Value;
-	}
-
-	echo json_encode($Result);
-	exit;
+    http_response_code($StatusCode);
+    echo json_encode(array_merge(array('Notice' => $Notice), $Extra));
+    exit;
 }
 
-// Grab the input
-$Input = json_decode(file_get_contents('php://input'), true);
-if (!is_array($Input)) {
-	RespondWithJsonNotice(400, 'WriteXIO.php invoked with bad inputs.');
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    header('Allow: POST');
+    RespondWithJsonNotice(405, 'Please submit feedback using POST.');
 }
 
-// Connect to the database:
-$Conn = new mysqli($Servername, $Username, $Password, $Dbname);
-if ($Conn->connect_error) {
-	die("Database connection failed: " . $Conn->connect_error);
+// The TEXT column holds at most 65,535 bytes. Leave room for question metadata.
+// Limit the outer JSON too, since escaping can make it larger than its contents.
+$RawInput = file_get_contents('php://input', false, null, 0, 262145);
+if (strlen($RawInput) > 262144) {
+    RespondWithJsonNotice(413, 'The feedback is too large to save.');
+}
+$Input = json_decode($RawInput, true);
+if (!is_array($Input) || !isset($Input['json']) || !is_string($Input['json'])) {
+    RespondWithJsonNotice(400, 'Please provide feedback as a JSON string.');
+}
+$Data = $Input['json'];
+if (strlen($Data) > 60000) {
+    RespondWithJsonNotice(413, 'The feedback is too large to save.');
+}
+$Decoded = json_decode($Data, true);
+if (json_last_error() !== JSON_ERROR_NONE || !is_array($Decoded) || count($Decoded) === 0) {
+    RespondWithJsonNotice(400, 'The feedback contains invalid JSON.');
 }
 
-// Extract the data
-$data = $Input['json'];
-$data = mysqli_real_escape_string($Conn, $data);
+require_once __DIR__ . '/Credentials.php';
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
-// Set DateTime
-$Now = new DateTimeImmutable("now", new DateTimeZone('Europe/London'));
-$DateTime = $Now->format('Y-m-d\TH:i:s');
+try {
+    $Conn = new mysqli($Servername, $Username, $Password, $Dbname);
+    $Conn->set_charset('utf8mb4');
+    $Now = new DateTimeImmutable('now', new DateTimeZone('Europe/London'));
+    $DateTime = $Now->format('Y-m-d H:i:s');
 
-// Save the data
-$Sql = "INSERT INTO TiCN (Json, DateTime) VALUES ('$data', '$DateTime')";
-if (($Conn->query($Sql)) === false) {
-	$Conn->close();
-	die('Query Sql failed to execute successfully.');
+    $Statement = $Conn->prepare('INSERT INTO TiCN (Json, DateTime) VALUES (?, ?)');
+    $Statement->bind_param('ss', $Data, $DateTime);
+    $Statement->execute();
+    $Statement->close();
+    $Conn->close();
+} catch (mysqli_sql_exception $Error) {
+    // Keep database details and student feedback out of the response and logs.
+    error_log('TiCN feedback: database save failed (code ' . $Error->getCode() . ').');
+    RespondWithJsonNotice(503, 'We could not save your feedback. Please try again.');
 }
 
-$Conn->close();
-echo json_encode('Done');
+RespondWithJsonNotice(200, 'Your feedback has been saved.', array('saved' => true));
